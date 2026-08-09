@@ -3,6 +3,10 @@ build/
 dist/
 *.spec
 
+# AchieveSort — datos generados en ejecución (no deben subirse al repo)
+achievesort_cache.json
+achievesort_resultados_*.csv
+
 # Python
 __pycache__/
 *.pyc

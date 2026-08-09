@@ -20,12 +20,35 @@ Configuración:
 
     1. Consigue tu API key en https://steamcommunity.com/dev/apikey
     2. Consigue tu SteamID64 (steamid.io o tu perfil de Steam)
+
+Funciones adicionales:
+    - Caché local de porcentajes globales de logros (achievements_cache.json),
+      para no repetir esa llamada a la API en próximas ejecuciones.
+    - Filtro opcional por horas jugadas mínimas.
+    - Exportación de resultados a CSV.
 """
 
+import csv
+import json
+import os
+import sys
 import time
+from datetime import datetime, timedelta
+
 import requests
 
 BASE_URL = "https://api.steampowered.com"
+
+# La caché se guarda junto al ejecutable/script, no en la carpeta desde la
+# que se lanza, para que siempre sea la misma independientemente de dónde
+# se ejecute.
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(sys.executable)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CACHE_PATH = os.path.join(APP_DIR, "achievesort_cache.json")
+CACHE_MAX_AGE_DAYS = 7  # los % globales apenas varían; una semana es un buen margen
 
 
 def pedir_credenciales():
@@ -47,6 +70,37 @@ def pedir_credenciales():
         raise SystemExit("El SteamID64 debe ser un número de 17 dígitos. Cancelando.")
 
     return api_key, steam_id
+
+
+def cargar_cache():
+    """Carga la caché de % globales desde disco. Devuelve un dict vacío si no existe o está corrupta."""
+    if not os.path.exists(CACHE_PATH):
+        return {}
+    try:
+        with open(CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def guardar_cache(cache):
+    """Guarda la caché en disco. Si falla (permisos, disco lleno...), no interrumpe el programa."""
+    try:
+        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+
+
+def entrada_cache_valida(entrada):
+    """Comprueba que una entrada de caché exista y no haya caducado."""
+    if not entrada or "fecha" not in entrada or "datos" not in entrada:
+        return False
+    try:
+        fecha = datetime.fromisoformat(entrada["fecha"])
+    except ValueError:
+        return False
+    return datetime.now() - fecha < timedelta(days=CACHE_MAX_AGE_DAYS)
 
 
 def verificar_credenciales(api_key, steam_id):
@@ -93,13 +147,21 @@ def get_player_achievements(api_key, steam_id, appid):
     return data.get("achievements", [])
 
 
-def get_global_achievement_percentages(appid):
-    """% global de jugadores que tiene cada logro de un juego."""
+def get_global_achievement_percentages(appid, cache):
+    """
+    % global de jugadores que tiene cada logro de un juego.
+    Usa la caché en disco si hay una entrada reciente para este appid.
+    """
+    clave = str(appid)
+    entrada = cache.get(clave)
+    if entrada_cache_valida(entrada):
+        return entrada["datos"], True  # (datos, venía_de_caché)
+
     url = f"{BASE_URL}/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v2/"
     params = {"gameid": appid}
     r = requests.get(url, params=params, timeout=15)
     if r.status_code != 200:
-        return {}
+        return {}, False
     achievements = r.json().get("achievementpercentages", {}).get("achievements", [])
     resultado = {}
     for a in achievements:
@@ -107,57 +169,118 @@ def get_global_achievement_percentages(appid):
             resultado[a["name"]] = float(a["percent"])
         except (KeyError, TypeError, ValueError):
             continue  # dato corrupto o ausente para este logro, se ignora
-    return resultado
+
+    if resultado:
+        cache[clave] = {"fecha": datetime.now().isoformat(), "datos": resultado}
+
+    return resultado, False
 
 
-def calculate_mdo(api_key, steam_id, appid, game_name):
+def calculate_mdo(api_key, steam_id, appid, game_name, cache):
     """
     Calcula el MDO de un juego a partir de sus logros pendientes.
-    Devuelve (resultado, motivo):
+    Devuelve (resultado, motivo, desde_cache):
       - resultado = (mdo, logros_totales, logros_pendientes) o None
       - motivo se rellena solo cuando resultado es None, para diagnóstico
+      - desde_cache indica si el % global vino de la caché local
     """
     achievements = get_player_achievements(api_key, steam_id, appid)
     if not achievements:
-        return None, "sin_logros_o_perfil_privado"
+        return None, "sin_logros_o_perfil_privado", False
 
     pending = [a["apiname"] for a in achievements if a["achieved"] == 0]
     if not pending:
-        return None, "completado_100"
+        return None, "completado_100", False
 
-    percentages = get_global_achievement_percentages(appid)
+    percentages, desde_cache = get_global_achievement_percentages(appid, cache)
     if not percentages:
-        return None, "sin_datos_globales"
+        return None, "sin_datos_globales", False
 
     # Dificultad de cada logro pendiente = 100 - % global que lo tiene
     dificultades = [
         100 - percentages[name] for name in pending if name in percentages
     ]
     if not dificultades:
-        return None, "sin_coincidencia_logros"
+        return None, "sin_coincidencia_logros", desde_cache
 
     mdo = sum(dificultades) / len(dificultades)
-    return (round(mdo, 2), len(achievements), len(pending)), None
+    return (round(mdo, 2), len(achievements), len(pending)), None, desde_cache
+
+
+def pedir_filtro_horas():
+    """Pregunta si se quiere aplicar un filtro de horas jugadas mínimas."""
+    respuesta = input(
+        "¿Quieres excluir juegos con pocas horas jugadas? (s/N): "
+    ).strip().lower()
+    if respuesta != "s":
+        return 0.0
+
+    while True:
+        valor = input("Horas mínimas jugadas para incluir un juego (ej. 1): ").strip()
+        try:
+            horas = float(valor.replace(",", "."))
+            if horas < 0:
+                raise ValueError
+            return horas
+        except ValueError:
+            print("Introduce un número válido (ej. 1 o 2.5).")
+
+
+def exportar_csv(resultados):
+    """Exporta la tabla de resultados a un CSV junto al ejecutable/script."""
+    nombre_archivo = f"achievesort_resultados_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    ruta = os.path.join(APP_DIR, nombre_archivo)
+    try:
+        with open(ruta, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Juego", "AppID", "MDO", "Logros pendientes", "Logros totales", "Horas jugadas"])
+            for r in resultados:
+                writer.writerow([
+                    r["nombre"], r["appid"], r["mdo"],
+                    r["pendientes"], r["total_logros"], r["horas_jugadas"],
+                ])
+        print(f"Resultados exportados a: {ruta}")
+    except OSError as e:
+        print(f"No se pudo exportar el CSV: {e}")
 
 
 def main():
     api_key, steam_id = pedir_credenciales()
     verificar_credenciales(api_key, steam_id)
 
-    print("Obteniendo biblioteca de juegos...")
+    horas_minimas = pedir_filtro_horas()
+
+    cache = cargar_cache()
+
+    print("\nObteniendo biblioteca de juegos...")
     games = get_owned_games(api_key, steam_id)
-    print(f"{len(games)} juegos encontrados. Analizando logros (esto puede tardar)...\n")
+
+    if horas_minimas > 0:
+        antes = len(games)
+        games = [g for g in games if g.get("playtime_forever", 0) / 60 >= horas_minimas]
+        print(f"Filtro de horas aplicado: {antes} -> {len(games)} juegos (>= {horas_minimas}h jugadas).")
+
+    print(f"{len(games)} juegos a analizar. Consultando logros (esto puede tardar)...\n")
 
     resultados = []
     motivos = {}
+    consultas_nuevas = 0
+
     for game in games:
         appid = game["appid"]
         name = game.get("name", f"App {appid}")
+        horas_jugadas = round(game.get("playtime_forever", 0) / 60, 1)
 
         try:
-            resultado, motivo = calculate_mdo(api_key, steam_id, appid, name)
+            resultado, motivo, desde_cache = calculate_mdo(api_key, steam_id, appid, name, cache)
         except Exception:
-            resultado, motivo = None, "error_inesperado"
+            resultado, motivo, desde_cache = None, "error_inesperado", False
+
+        # Solo esperamos entre llamadas si de verdad hemos consultado la API
+        # (el endpoint de logros del jugador siempre se consulta; el de %
+        # globales solo si no venía de caché)
+        if not desde_cache:
+            consultas_nuevas += 1
         time.sleep(SLEEP_BETWEEN_CALLS)
 
         if resultado is None:
@@ -171,15 +294,18 @@ def main():
             "mdo": mdo,
             "total_logros": total,
             "pendientes": pendientes,
+            "horas_jugadas": horas_jugadas,
         })
+
+    guardar_cache(cache)
 
     # Ordenar de más fácil de rematar (MDO bajo) a más difícil (MDO alto)
     resultados.sort(key=lambda x: x["mdo"])
 
-    print(f"{'Juego':<40}{'MDO':>8}{'Pendientes':>14}{'Total':>10}")
-    print("-" * 72)
+    print(f"{'Juego':<40}{'MDO':>8}{'Pendientes':>14}{'Total':>10}{'Horas':>10}")
+    print("-" * 82)
     for r in resultados:
-        print(f"{r['nombre'][:38]:<40}{r['mdo']:>8}{r['pendientes']:>14}{r['total_logros']:>10}")
+        print(f"{r['nombre'][:38]:<40}{r['mdo']:>8}{r['pendientes']:>14}{r['total_logros']:>10}{r['horas_jugadas']:>10}")
 
     if not resultados:
         print("No se encontró ningún juego con logros pendientes calculables.\n")
@@ -193,6 +319,9 @@ def main():
         }
         for motivo, cantidad in sorted(motivos.items(), key=lambda x: -x[1]):
             print(f"  - {etiquetas.get(motivo, motivo)}: {cantidad} juegos")
+    else:
+        print(f"\n({consultas_nuevas} juegos consultados a la API; el resto vino de la caché local)")
+        exportar_csv(resultados)
 
 
 if __name__ == "__main__":

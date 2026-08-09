@@ -4,6 +4,8 @@
 
 Calcula el **MDO** (dificultad media de tus logros pendientes) de toda tu biblioteca de Steam, para saber qué juegos te conviene rematar primero (fáciles) y cuáles son el reto de verdad (raros).
 
+Ver [CHANGELOG.md](CHANGELOG.md) para el historial de versiones.
+
 ## Qué hace
 
 1. Lee tu biblioteca de juegos de Steam.
@@ -11,11 +13,17 @@ Calcula el **MDO** (dificultad media de tus logros pendientes) de toda tu biblio
 3. Calcula un **MDO** por juego: la media de "rareza" de tus logros pendientes.
    - **MDO bajo** → lo que te falta es común, fácil de rematar.
    - **MDO alto** → lo que te falta es raro/costoso.
-4. Te muestra una tabla ordenada de más fácil a más difícil.
+4. Te muestra una tabla ordenada de más fácil a más difícil, y la exporta también a CSV.
+
+## Funciones adicionales
+
+- **Filtro por horas jugadas**: al ejecutarlo, puedes excluir juegos con pocas horas para centrarte en los que de verdad juegas.
+- **Caché local** (`achievesort_cache.json`): los porcentajes globales de logros apenas cambian, así que se guardan localmente 7 días. Las siguientes ejecuciones son más rápidas porque no repiten esas llamadas a la API (sí se sigue consultando siempre tu progreso personal, que es lo que puede cambiar entre ejecuciones).
+- **Exportación a CSV**: cada ejecución genera `achievesort_resultados_AAAAMMDD_HHMMSS.csv` junto al ejecutable, con todos los datos de la tabla.
 
 ## Privacidad
 
-No se guarda ningún dato. Tu API key y tu SteamID64 se piden por consola en cada ejecución y solo existen en memoria mientras el programa corre.
+Tu API key y tu SteamID64 se piden por consola en cada ejecución y solo existen en memoria mientras el programa corre; no se guardan en ningún archivo. La única información que se persiste en disco es la caché de porcentajes globales de logros (públicos, no personales) y los CSV de resultados que tú mismo generas.
 
 ## Requisitos
 
